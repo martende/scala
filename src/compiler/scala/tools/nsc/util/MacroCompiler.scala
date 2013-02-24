@@ -39,10 +39,12 @@ abstract class JitCompiler extends Traces {
     // Select here should work - we don't need types of calling params
     // becuase function can not be overloaded
     val methSelector = parts.tail.foldLeft[g.Tree](g.Ident(g.newTermName(parts.head)))((a,b)=>g.Select(a,g.newTermName(b)))
-
     val typer = analyzer.newTyper(context)
+
+    val silentTyper = analyzer.newTyper(typer.context.makeSilent(reportAmbiguousErrors=false))
+
     val methodSym:g.Symbol = try {
-      typer.typed1(methSelector , EXPRmode, g.WildcardType).symbol
+      silentTyper.typed1(methSelector , EXPRmode, g.WildcardType).symbol
     }  catch {
       case ex: g.TypeError => macroLogExpand("TypeError in methSelector typing gona die error=" + ex)
         throw(ex)
@@ -153,7 +155,7 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
       abstract class JitImporter extends StandardImporter {
         val global:Global = from.asInstanceOf[Global]
         protected lazy val completerMap = new Cache[Symbol, Tree]()
-        
+        override val rewriteWithLocals=true
         val debug = false
 
         @inline final def importerDebug(msg: => Any) { if (debug) println(msg) }
@@ -464,16 +466,16 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
           externalSyms+=s
           
         }
-        // TODO: Remove NAHUY
+        
         tree match {
           case _:Template | _:Apply | _:AppliedTypeTree => super.traverse(tree)
           case tpt:TypeTree => 
             if (tpt.original != null)
               traverse(tpt.original)
-          case el @ Select(qual,_)  =>
-            var s = el.symbol
-            tryToEnter(s)
-            super.traverse(tree)
+          //case el @ Select(qual,_)  =>
+          //  var s = el.symbol
+          //  tryToEnter(s)
+          //  super.traverse(tree)
           case _ => tree.symbol match {
             case null | NoSymbol => super.traverse(tree)
             case s:Symbol => //if (isExternal(s) && ifDefinedInTree(s) )  =>
@@ -489,22 +491,28 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
     }
 
     private class PathFinder(sym:Symbol) extends Traverser {
-      var result: Option[(Tree,WalkPath)] = None
+      // Result is Tree , Path to this tree , isPrimary constructor (for defdef only 
+      //  - optimisation purposes - we dont need to traverse tree again) 
+      var result: Option[(Tree,WalkPath,Boolean)] = None
       private val path = new Stack[Int]
       private var cIdx = 0
+
+      private var isPrimaryConstructor = false 
 
       def isGetterOf(s1:Symbol,s2:Symbol) = s2 != null && s2 != NoSymbol && s1 != null && s1 != NoSymbol && s2.getter(s2.enclClass) == s1
 
       override def traverse(tree: Tree) = tree match {
         case _ if (! result.isEmpty) =>
-        // case DefDef(mods, name, tparams, vparamss, tpt, rhs)
-        // TODO: memberdef ??
-        case _:DefDef         if tree.symbol == sym => result = Some((tree,(cIdx :: path.toList).reverse))
-        case _:ValDef         if tree.symbol == sym || isGetterOf(sym,tree.symbol) => result = Some((tree,(cIdx :: path.toList).reverse))
-        case _:ClassDef       if tree.symbol == sym => result = Some((tree,(cIdx :: path.toList).reverse))
-        case _:TypeDef        if tree.symbol == sym => result = Some((tree,(cIdx :: path.toList).reverse))
-        case _:ModuleDef      if tree.symbol == sym => result = Some((tree,(cIdx :: path.toList).reverse))
+        case ddef:DefDef if tree.symbol == sym => 
+            result = Some((tree,(cIdx :: path.toList).reverse,ddef.name == nme.CONSTRUCTOR && isPrimaryConstructor))        
+        case _:ValDef if tree.symbol == sym || isGetterOf(sym,tree.symbol) => result = Some((tree,(cIdx :: path.toList).reverse,false))
+        case _:ClassDef|_:TypeDef|_:ModuleDef if tree.symbol == sym => result = Some((tree,(cIdx :: path.toList).reverse,false))
         case _ =>
+          tree match {
+            case _:Template       => isPrimaryConstructor = true
+            case DefDef(_, nme.CONSTRUCTOR, _, _, _, _) => isPrimaryConstructor=false
+            case _ => 
+          }
           path.push(cIdx)
           cIdx=0
           super.traverse(tree)
@@ -532,7 +540,7 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
         val pf = new PathFinder(symbol)
         pf.traverse(u.body)
         pf.result match {
-          case Some((ast:Tree,path:WalkPath)) =>
+          case Some((ast:Tree,path:WalkPath,isPrimaryConstructor:Boolean)) =>
             ast match {
               case ModuleDef(_,_, impl) => 
                 // ModuleDef as external element dont need full typing
@@ -547,10 +555,14 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
                     throw ex
                 }
                 Option(SymbolPath(ast.symbol,u,ast,path))
+              case _:DefDef if isPrimaryConstructor  => // primary constructor 
+                macroLogExpand("!!!getAst Skip Constructor typing rawAst="+showRaw(ast) )
+                // Skip Constructor typing 
+                Option(SymbolPath(ast.symbol,u,ast,path))
               case _ => 
                 val tmpTyper = mkPathTyper(u,path)
 
-                macroLogExpand("!!!getAst rawAst="+showRaw(ast))
+                macroLogExpand("!!!getAst rawAst="+showRaw(ast) )
                 
                 val typedAst = try {
                   tmpTyper.context.withMacrosDisabled {
@@ -579,7 +591,7 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
                 if (! errorsToReport.isEmpty ) {
                   val fatalErrors = errorsToReport.filter(filterNonFatalErrors(_))
                   if (! fatalErrors.isEmpty ) {
-                    println("!!!macroLogExpand typer errors: error[0].class=" + fatalErrors.head.getClass + " fatalErrors=" + fatalErrors)
+                    macroLogExpand("!!!macroLogExpand typer errors: error[0].class=" + fatalErrors.head.getClass + " fatalErrors=" + fatalErrors)
                     throw new JitCompilerException("getAst typer exception" + fatalErrors)
                   }
                 } else if (typedAst exists (_.isErroneous)) {
@@ -715,7 +727,8 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
                 val dupl = tree.duplicate
                 if (tree.hasSymbolField)
                   dupl.symbol = NoSymbol
-                dupl.tpe = null
+                if (dupl.canHaveAttrs)
+                  dupl.tpe = null
                 dupl
             }
             if (debug)
@@ -807,9 +820,9 @@ abstract class JitInternalGlobal(currentSettings: Settings, reporter: Reporter) 
           PackageDef(pid,packUnitElementsList(unit,pid :: stats,els.map(_.shorten ),startTree).toList)
         case ModuleDef(mods,name,impl) =>
           ModuleDef(mods,name,packUnitElementsList(unit,mods.annotations :+ impl,els,startTree).head.asInstanceOf[Template])
-        case Template(parents, self, body) =>
-          val childs = ( if ( self.isEmpty ) parents else  parents :+self ) ++ body
-          Template(parents,self,packUnitElementsList(unit,childs,els,startTree).toList)
+        case Template(parents, selftree, body) =>
+          val childs = ( if ( selftree == emptyValDef ) parents else  parents :+selftree ) ++ body
+          Template(parents,selftree,packUnitElementsList(unit,childs,els,startTree).toList)
           //startTree
         case _:DefDef if pathEmpty=>
           startTree
